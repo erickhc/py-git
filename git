@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import shutil
+import hashlib
+import zlib
+import time
+from pathlib import Path
+
+CONFIG = '''
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+'''
+
+DESCRIPTION = '''Unnamed repository; edit this file 'description' to name the repository.'''
+HEAD = '''ref: refs/heads/master'''
+INFO_EXCLUDE = '''
+# git ls-files --others --exclude-from=.git/info/exclude
+# Lines that start with '#' are comments.
+# For a project mostly in C, the following would be a good set of
+# exclude patterns (uncomment them if you want to use them):
+# *.[oa]
+# *~
+'''
+
+
+def read_bytes(input, b):
+    return input[b:], input[:b]
+
+
+def read_u32(input):
+    input, b = read_bytes(input, 4)
+    return input, int.from_bytes(b, byteorder='big')
+
+
+def read_int(input, b):
+    input, b = read_bytes(input, b)
+    return input, int.from_bytes(b, byteorder='big')
+
+
+def read_until(input, c):
+    return read_bytes(input, input.find(c))
+
+
+def eprint(*values):
+    print(*values, file=sys.stderr)
+
+
+def bail(*values, exit_code=1):
+    eprint(*values)
+    sys.exit(exit_code)
+
+
+def init():
+    if Path('.git').exists():
+        shutil.rmtree('.git', ignore_errors=True)
+    os.mkdir('.git')
+    os.mkdir('.git/branches')
+    os.mkdir('.git/hooks')
+    os.mkdir('.git/info')
+    os.mkdir('.git/objects')
+    os.mkdir('.git/objects/info')
+    os.mkdir('.git/objects/pack')
+    os.mkdir('.git/refs')
+    os.mkdir('.git/refs/heads')
+    os.mkdir('.git/refs/tags')
+
+    for (path, content) in [('config', CONFIG), ('description', DESCRIPTION), ('HEAD', HEAD), ('info/exclude', INFO_EXCLUDE)]:
+        with open(f'.git/{path}', 'w') as f:
+            f.write(content.strip())
+            f.write('\n')
+
+
+def write_object(sha, header, content):
+    objects_dir = sha[:2]
+    objects_file = sha[2:]
+
+    path = f'.git/objects/{objects_dir}'
+    os.makedirs(path)
+    path += f'/{objects_file}'
+    with open(path, 'wb') as f:
+        f.write(zlib.compress(header + content))
+
+
+def gen_sha(header, content):
+    sha = hashlib.sha1()
+    sha.update(header)
+    sha.update(content)
+    sha = sha.hexdigest()
+
+    return sha
+
+
+def hash_object(object_type, *, file=None, write=False):
+    if object_type == 'file':
+        header = 'blob'
+    else:
+        raise RuntimeError('Unimplemented')
+
+    with open(file, 'rb') as f:
+        content = f.read()
+
+    header += f' {len(content)}\0'
+    header = header.encode('utf-8')
+    sha = gen_sha(header, content)
+
+    if write:
+        write_object(sha, header, content)
+
+    return sha
+
+
+def retrieve_object(sha):
+    path = f'.git/objects/{sha[:2]}/{sha[2:]}'
+    if not Path(path).exists():
+        bail('The given hash does not exist')
+
+    with open(path, 'rb') as f:
+        data = f.read()
+        file = zlib.decompress(data)
+
+    space = file.find(b' ')
+    nul = file.find(b'\0')
+    object_type = file[:space]
+    content_size = int(file[space:nul].decode('utf-8'))
+    content = file[nul+1:]
+
+    return (object_type, content_size, content)
+
+
+def cat_file(sha, pretty_print=False):
+    if not pretty_print:
+        bail('No option specified')
+
+    (object_type, _, content) = retrieve_object(sha)
+
+    if object_type == b'blob':
+        print(content.decode('utf-8'), end='')
+    elif object_type == b'tree':
+        while len(content) > 0:
+            content, mode = read_bytes(content, 6)
+            content, _ = read_bytes(content, 1)
+            content, file_name = read_until(content, b'\0')
+            content, _ = read_bytes(content, 1)
+            content, sha = read_int(content, 160 // 8)
+            print(mode.decode('utf-8'), file_name.decode('utf-8'), hex(sha).split('x')[1])
+    elif object_type == b'commit':
+        print(content.decode('utf-8'))
+    else:
+        bail(object_type, 'is not supported for pretty printing')
+
+
+def float_to_be_u32(f):
+    return (int(f) & 0xFFFFFFFF).to_bytes(4, byteorder='big')
+
+
+def update_index(file=None, cacheinfo=None, add=False):
+    if not add:
+        bail('cannot add to the index, did you mean --add? >_>')
+
+    if file is None and cacheinfo is None:
+        bail('no file was given')
+
+    if file is not None:
+        sha = hash_object('file', file=file, write=True)
+        path = file
+        stat = os.stat(file)
+        mode = '100644' if stat.st_mode & 0o111 == 0 else '100755'
+        with open(file, 'rb') as f:
+            content_size = f.seek(0, 2)
+    else:
+        [mode, sha, path] = cacheinfo.split(',')
+        if mode not in ['100644', '100755']:
+            bail('The given mode is not supported')
+        (object_type, content_size, _) = retrieve_object(sha)
+        if object_type != b'blob':
+            bail('Update index only supports blobs')
+
+    with open('.git/index', 'wb') as f:
+        stat = os.stat(path)
+
+        f.write(b'DIRC')
+        f.write(bytearray([0, 0, 0, 2]))
+        f.write(bytearray([0, 0, 0, 1]))
+        f.write(float_to_be_u32(stat.st_ctime))
+        f.write(float_to_be_u32(stat.st_ctime_ns))
+        f.write(float_to_be_u32(stat.st_mtime))
+        f.write(float_to_be_u32(stat.st_mtime_ns))
+        f.write(stat.st_dev.to_bytes(4, byteorder='big'))
+        f.write(stat.st_ino.to_bytes(4, byteorder='big'))
+        f.write(int(mode, 8).to_bytes(4, byteorder='big'))
+        f.write(stat.st_uid.to_bytes(4, byteorder='big'))
+        f.write(stat.st_gid.to_bytes(4, byteorder='big'))
+        f.write(content_size.to_bytes(4, byteorder='big'))
+        f.write(int(sha, 16).to_bytes(20, byteorder='big'))
+        f.write(min(0xFFF, len(path)).to_bytes(2, byteorder='big'))
+        f.write(path.encode('utf-8'))
+        f.write(bytearray([0] * (8 - (6 + len(path)) % 8)))
+
+
+def read_index():
+    path = '.git/index'
+
+    with open(path, 'rb') as f:
+        content = f.read()
+
+    content, dirc = read_bytes(content, 4)
+    assert dirc == b'DIRC'
+    content, version = read_u32(content)
+    assert version == 2
+
+    content, index_items = read_u32(content)
+
+    items = []
+
+    for _ in range(index_items):
+        skip = [
+            'ctime',
+            'ctime_ns',
+            'mtime',
+            'mtime_ms',
+            'dev',
+            'ino',
+        ]
+        content, _ = read_bytes(content, len(skip) * 4)
+        content, mode = read_u32(content)
+        skip = [
+            'uid',
+            'gid',
+            'content_size',
+        ]
+        content, _ = read_bytes(content, len(skip) * 4)
+        content, sha = read_bytes(content, 160 // 8)
+        content, name_length = read_int(content, 2)
+        name_length &= 0xFFF
+        content, name = read_bytes(content, name_length)
+        content, _ = read_bytes(content, 8 - (6 + name_length) % 8)
+        items.append((mode, sha, name))
+
+    return items
+
+
+def write_tree():
+    index = read_index()
+
+    tree = bytearray()
+
+    for (mode, sha, name) in index:
+        tree.extend(oct(mode & 0xFFFF).split('o')[1].encode('utf-8'))
+        tree.append(ord(' '))
+        tree.extend(name)
+        tree.append(ord('\0'))
+        tree.extend(sha)
+
+    header = b'tree ' + str(len(tree)).encode('utf-8') + b'\0'
+
+    sha = gen_sha(header, tree)
+    write_object(sha, header, tree)
+    return sha
+
+
+def commit_tree(tree, *, name=None, email=None):
+    if not Path(f'.git/objects/{tree[:2]}/{tree[2:]}').exists():
+        bail('The given tree does not exist')
+    (object_type, _, _) = retrieve_object(tree)
+    if object_type != b'tree':
+        bail('The given object is not a tree')
+
+    header = 'commit '
+
+    content = 'tree ' + tree + '\n'
+    author_committer = f'{name} <{email}> {str(int(time.time()))} +0000\n'
+    content += 'author ' + author_committer
+    content += 'committer ' + author_committer + ' \n'
+
+    msg = input()
+    content += msg + '\n'
+
+    header += str(len(content)) + '\0'
+    header = header.encode('utf-8')
+    content = content.encode('utf-8')
+    sha = gen_sha(header, content)
+    write_object(sha, header, content)
+    return sha
+
+
+def update_refs(ref, commit):
+    (object_type, _, _) = retrieve_object(commit)
+    if object_type != b'commit':
+        bail('The given hash does not point to a valid commit')
+
+    parts = ref.split('/')
+    if len(parts) != 3:
+        bail("Ref must be in the format refs/heads/master")
+
+    if parts[0] != 'refs':
+        bail('The first item must be refs')
+
+    if parts[1] != 'heads':
+        bail('Only updating the heads is supported')
+
+    with open(f'.git/{ref}', 'w') as f:
+        f.write(commit)
+
+
+def main(args):
+    if args.subcommand == 'init':
+        init()
+    elif args.subcommand == 'hash-object':
+        print(hash_object('file', file=args.file, write=args.w))
+    elif args.subcommand == 'cat-file':
+        cat_file(sha=args.sha, pretty_print=args.pretty_print)
+    elif args.subcommand == 'update-index':
+        update_index(file=args.file, cacheinfo=args.cacheinfo, add=args.add)
+    elif args.subcommand == 'write-tree':
+        print(write_tree())
+    elif args.subcommand == 'commit-tree':
+        print(commit_tree(args.tree, name=args.name, email=args.email))
+    elif args.subcommand == 'update-ref':
+        update_refs(ref=args.ref, commit=args.commit)
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser('Git')
+    subparsers = parser.add_subparsers(dest='subcommand', required=True)
+
+    init_parser = subparsers.add_parser('init')
+
+    hash_object_parser = subparsers.add_parser('hash-object')
+    hash_object_parser.add_argument(
+        '-w',
+        action='store_true',
+        default=False,
+        help='Writes the hash object to disk'
+    )
+    hash_object_parser.add_argument('file', help='Sets the file to hash')
+
+    cat_file_parser = subparsers.add_parser('cat-file')
+    cat_file_parser.add_argument(
+        '-p',
+        dest='pretty_print',
+        action='store_true',
+        required=True,
+        help='Pretty prints the object depending on the type'
+    )
+    cat_file_parser.add_argument('sha', help='Sha of the object to print')
+
+    update_index_parser = subparsers.add_parser('update-index')
+    update_index_parser.add_argument(
+        '--add',
+        action='store_true',
+        default=False,
+        help='Adds the given path to the index'
+    )
+    update_index_parser.add_argument(
+        '--cacheinfo',
+        default=None,
+        help='Arguments must be given in the following format {mode},{hash},{path}'
+    )
+    update_index_parser.add_argument('file', nargs='?', default=None, help='File to add to the index')
+
+    write_tree_parser = subparsers.add_parser('write-tree')
+
+    commit_tree_parser = subparsers.add_parser('commit-tree')
+    commit_tree_parser.add_argument(
+        '--name',
+        required=True,
+        help='Sets the name of the commiter'
+    )
+    commit_tree_parser.add_argument(
+        '--email',
+        required=True,
+        help='Sets the email of the commiter'
+    )
+    commit_tree_parser.add_argument('tree', help='Creates a commit from the given tree')
+
+    update_refs_parser = subparsers.add_parser('update-ref')
+    update_refs_parser.add_argument('ref', help='Sets the ref to be updated')
+    update_refs_parser.add_argument('commit', help='Which commit to set the ref to')
+
+    args = parser.parse_args()
+
+    main(args)

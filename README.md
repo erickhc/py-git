@@ -60,3 +60,14 @@ committer Erick Hernandez Curiel <Erick.HernandezCuriel@mx.bosch.com> 1581607242
 Init commit
 
 ```
+
+### Printing the type of an object
+
+```bash
+$ ./git cat-file -t 1f0d599f4a702177a95f282bca4f3141c481ecde
+blob
+$ ./git cat-file -t fe46efb2c730f8cf4d1aa82fb2a775d380fb9c06
+tree
+$ ./git cat-file -t 687057a776d350815418972f3f001a25b88a259e
+commit
+```

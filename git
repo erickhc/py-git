@@ -132,11 +132,17 @@ def retrieve_object(sha):
     return (object_type, content_size, content)
 
 
-def cat_file(sha, pretty_print=False):
-    if not pretty_print:
+def cat_file(sha, pretty_print=False, print_type=False):
+    if not pretty_print and not print_type:
         bail('No option specified')
 
     (object_type, _, content) = retrieve_object(sha)
+
+    if print_type:
+        print(object_type.decode('utf-8'))
+
+    if not pretty_print:
+        return
 
     if object_type == b'blob':
         print(content.decode('utf-8'), end='')
@@ -313,7 +319,7 @@ def main(args):
     elif args.subcommand == 'hash-object':
         print(hash_object('file', file=args.file, write=args.w))
     elif args.subcommand == 'cat-file':
-        cat_file(sha=args.sha, pretty_print=args.pretty_print)
+        cat_file(sha=args.sha, pretty_print=args.pretty_print, print_type=args.print_type)
     elif args.subcommand == 'update-index':
         update_index(file=args.file, cacheinfo=args.cacheinfo, add=args.add)
     elif args.subcommand == 'write-tree':
@@ -346,8 +352,15 @@ if __name__ == '__main__':
         '-p',
         dest='pretty_print',
         action='store_true',
-        required=True,
+        default=False,
         help='Pretty prints the object depending on the type'
+    )
+    cat_file_parser.add_argument(
+        '-t',
+        dest='print_type',
+        action='store_true',
+        default=False,
+        help='Prints the type of the object'
     )
     cat_file_parser.add_argument('sha', help='Sha of the object to print')
 
